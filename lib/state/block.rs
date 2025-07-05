@@ -24,7 +24,7 @@ unsafe impl<'a> Sync for SyncRoTxn<'a> {}
 impl<'a> Deref for SyncRoTxn<'a> {
     type Target = sneed::RoTxn<'a>;
     fn deref(&self) -> &Self::Target {
-        self.0 
+        self.0
     }
 }
 pub fn validate(
