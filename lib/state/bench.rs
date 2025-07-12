@@ -528,6 +528,9 @@ fn connect_blocks(
     n_blocks: u32,
 ) -> anyhow::Result<std::time::Duration> {
     let mut res = std::time::Duration::ZERO;
+    const BATCH_SIZE: u32 = 5;
+
+    let mut blocks = Vec::new();
     for _ in 0..n_blocks {
         use bitcoin::hashes::Hash as _;
         use rand::Rng as _;
@@ -553,6 +556,23 @@ fn connect_blocks(
         rwtxn.commit()?;
         res += start.elapsed();
         setup.tip_hash = block.header.hash();
+    }
+
+    for batch in blocks.chunks(BATCH_SIZE as usize) {
+        let start = std::time::Instant::now();
+        let mut rwtxn = setup.env.write_txn()?;
+        
+        for (block, _) in batch {
+            setup
+                .state
+                .validate_block(&rwtxn, &block.header, &block.body)?;
+            setup
+                .state
+                .connect_block(&mut rwtxn, &block.header, &block.body)?;
+        }
+        
+        rwtxn.commit()?;
+        res += start.elapsed();
     }
     Ok(res)
 }

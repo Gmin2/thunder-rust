@@ -89,10 +89,14 @@ impl Verify for Authorization {
 }
 
 pub fn get_address(verifying_key: &VerifyingKey) -> Address {
-    let mut hasher = blake3::Hasher::new();
-    let mut reader = hasher.update(&verifying_key.to_bytes()).finalize_xof();
+    // let mut hasher = blake3::Hasher::new();
+    // let mut reader = hasher.update(&verifying_key.to_bytes()).finalize_xof();
+    // let mut output: [u8; 20] = [0; 20];
+    // reader.fill(&mut output);
+    // Address(output)
+    let hash = blake3::hash(&verifying_key.to_bytes());
     let mut output: [u8; 20] = [0; 20];
-    reader.fill(&mut output);
+    output.copy_from_slice(&hash.as_bytes()[..20]);
     Address(output)
 }
 
@@ -127,16 +131,16 @@ pub fn verify_authorized_transaction(
 }
 
 pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
-    // Step 1: Serialize transactions in parallel. This is efficient and correct.
+    if body.authorizations.is_empty() {
+        return Ok(());
+    }
+
     let serialized_transactions: Vec<Vec<u8>> = body
         .transactions
         .par_iter()
         .map(borsh::to_vec)
         .collect::<Result<_, _>>()?;
 
-    // Step 2: Prepare the data for verification in a simple, sequential loop.
-    // This is fast because it only manipulates pointers, not heavy data,
-    // and it avoids all the complex ownership errors.
     let mut pairs: Vec<(&[u8], &Authorization)> = Vec::with_capacity(body.authorizations.len());
     let mut auth_iter = body.authorizations.iter();
     for (tx_idx, tx) in body.transactions.iter().enumerate() {
@@ -146,21 +150,15 @@ pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
         }
     }
 
-    // Safety check to ensure our logic was correct.
     assert_eq!(pairs.len(), body.authorizations.len());
 
-    // Step 3: THE CACHE OPTIMIZATION.
-    // Process the prepared `pairs` vector in large, contiguous chunks.
-    // Each thread gets a whole slice of `pairs` to work on, which improves cache hits.
     pairs
-        .par_chunks(4096) // The chunk size is tunable, but this is a good default.
+        .par_chunks(8192)
         .try_for_each(|chunk| {
-            // Unzip the local chunk into separate vectors. This is fast.
             let (messages, authorizations): (Vec<&[u8]>, Vec<&Authorization>) = chunk.iter().copied().unzip();
             let signatures: Vec<Signature> = authorizations.iter().map(|a| a.signature).collect();
             let verifying_keys: Vec<VerifyingKey> = authorizations.iter().map(|a| a.verifying_key).collect();
 
-            // Verify this large chunk as a single batch.
             ed25519_dalek::verify_batch(&messages, &signatures, &verifying_keys)
         })?;
 

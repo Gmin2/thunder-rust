@@ -41,6 +41,9 @@ pub fn validate(
         };
         return Err(Error::InvalidHeader(err));
     };
+    if body.transactions.is_empty() && body.authorizations.is_empty() {
+        return Ok(bitcoin::Amount::ZERO);
+    }
     let height = state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
     if body.authorizations.len() > State::body_sigops_limit(height) {
         return Err(Error::TooManySigops);
