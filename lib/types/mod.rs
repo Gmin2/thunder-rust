@@ -18,6 +18,7 @@ use utoipa::ToSchema;
 use crate::{
     authorization::Authorization, types::transaction::ComputeFeeError,
 };
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _, IndexedParallelIterator as _};
 
 mod address;
 pub mod hashes;
@@ -644,37 +645,97 @@ impl Body {
         coinbase: &[Output],
         txs: &[FilledTransaction],
     ) -> Result<MerkleRoot, ComputeMerkleRootError> {
-        let CbmtNode {
-            commitment: txs_root,
-            ..
-        } = {
+        // let CbmtNode {
+        //     commitment: txs_root,
+        //     ..
+        // } = {
+        //     let n_txs = txs.len();
+        //     let leaves: Vec<_> = txs
+        //         .iter()
+        //         .enumerate()
+        //         .map(|(idx, tx)| {
+        //             let fees = tx.get_fee().map_err(|err| {
+        //                 ComputeMerkleRootErrorInner {
+        //                     txid: tx.transaction.txid(),
+        //                     source: err,
+        //                 }
+        //             })?;
+        //             let canonical_size = tx.transaction.canonical_size();
+        //             let leaf_pre_commitment = CbmtLeafPreCommitment {
+        //                 fee: fees,
+        //                 canonical_size,
+        //                 tx: &tx.transaction,
+        //             };
+        //             Ok::<_, ComputeMerkleRootError>(CbmtNode {
+        //                 commitment: hashes::hash(&leaf_pre_commitment),
+        //                 fees,
+        //                 canonical_size,
+        //                 // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+        //                 index: (idx + n_txs) - 1,
+        //             })
+        //         })
+        //         .collect::<Result<_, _>>()?;
+        //     CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
+        // };
+
+        let CbmtNode { commitment: txs_root, .. } = {
             let n_txs = txs.len();
-            let leaves: Vec<_> = txs
-                .iter()
-                .enumerate()
-                .map(|(idx, tx)| {
-                    let fees = tx.get_fee().map_err(|err| {
-                        ComputeMerkleRootErrorInner {
-                            txid: tx.transaction.txid(),
-                            source: err,
-                        }
-                    })?;
-                    let canonical_size = tx.transaction.canonical_size();
-                    let leaf_pre_commitment = CbmtLeafPreCommitment {
-                        fee: fees,
-                        canonical_size,
-                        tx: &tx.transaction,
-                    };
-                    Ok::<_, ComputeMerkleRootError>(CbmtNode {
-                        commitment: hashes::hash(&leaf_pre_commitment),
-                        fees,
-                        canonical_size,
-                        // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
-                        index: (idx + n_txs) - 1,
+
+            let leaves: Result<Vec<_>, _> = if txs.len() > 1000 {
+                // Use parallel for large batches
+                txs.par_iter()
+                    .enumerate()
+                    .map(|(idx, tx)| {
+                        let fees = tx.get_fee().map_err(|err| {
+                            ComputeMerkleRootErrorInner {
+                                txid: tx.transaction.txid(),
+                                source: err,
+                            }
+                        })?;
+                        let canonical_size = tx.transaction.canonical_size();
+                        let leaf_pre_commitment = CbmtLeafPreCommitment {
+                            fee: fees,
+                            canonical_size,
+                            tx: &tx.transaction,
+                        };
+                        Ok::<_, ComputeMerkleRootError>(CbmtNode {
+                            commitment: hashes::hash(&leaf_pre_commitment),
+                            fees,
+                            canonical_size,
+                            // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+                            index: (idx + n_txs) - 1,
+                        })
                     })
-                })
-                .collect::<Result<_, _>>()?;
-            CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
+                    .collect()
+            } else {
+                // Use sequential for smaller batches
+                txs.iter()
+                    .enumerate()
+                    .map(|(idx, tx)| {
+                        let fees = tx.get_fee().map_err(|err| {
+                            ComputeMerkleRootErrorInner {
+                                txid: tx.transaction.txid(),
+                                source: err,
+                            }
+                        })?;
+                        let canonical_size = tx.transaction.canonical_size();
+                        let leaf_pre_commitment = CbmtLeafPreCommitment {
+                            fee: fees,
+                            canonical_size,
+                            tx: &tx.transaction,
+                        };
+                        Ok::<_, ComputeMerkleRootError>(CbmtNode {
+                            commitment: hashes::hash(&leaf_pre_commitment),
+                            fees,
+                            canonical_size,
+                            // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+                            index: (idx + n_txs) - 1,
+                        })
+                    })
+                    .collect()
+            };
+            
+            CbmtWithFeeTotal::build_merkle_root(leaves?.as_slice())
         };
         // FIXME: Compute actual merkle root instead of just a hash.
         let coinbase_root = hashes::hash(&coinbase);

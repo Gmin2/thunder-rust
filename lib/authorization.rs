@@ -1,18 +1,38 @@
 use borsh::BorshSerialize;
 use rayon::{
-    iter::{IntoParallelRefIterator as _, ParallelIterator as _},
-    slice::ParallelSlice as _,
+    iter::{IntoParallelRefIterator as _, ParallelIterator as _, IntoParallelIterator as _},
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use std::{cell::RefCell, collections::HashMap};
 
 use crate::types::{
-    Address, AuthorizedTransaction, Body, GetAddress, Transaction, Verify,
+    Address, AuthorizedTransaction, Body, GetAddress, Transaction, Verify, Txid,
 };
 
 pub use ed25519_dalek::{
     Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey,
 };
+
+thread_local! {
+    static TX_SERIALIZATION_CACHE: RefCell<HashMap<Txid, Vec<u8>>> = 
+        RefCell::new(HashMap::new());
+}
+
+pub fn cached_serialize_transaction(tx: &Transaction) -> Result<Vec<u8>, Error> {
+    let txid = tx.txid();
+    
+    TX_SERIALIZATION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(serialized) = cache.get(&txid) {
+            Ok(serialized.clone())
+        } else {
+            let serialized = borsh::to_vec(tx).map_err(Error::BorshSerialize)?;
+            cache.insert(txid, serialized.clone());
+            Ok(serialized)
+        }
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -139,32 +159,49 @@ pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
     if verifications_required == 0 {
         return Ok(());
     }
-    // pairs of serialized txs, and the number of inputs
-    let serialized_transactions_inputs: Vec<(Vec<u8>, usize)> = body
+
+    const CHUNK_SIZE: usize = 1 << 10;
+    let mut all_signatures = Vec::with_capacity(body.authorizations.len());
+    let mut all_verifying_keys = Vec::with_capacity(body.authorizations.len());
+    let mut all_messages = Vec::with_capacity(body.authorizations.len());
+
+    let serialized_transactions: Result<Vec<_>, _> = body
         .transactions
-        .par_iter()
-        .map(|tx| Ok((borsh::to_vec(tx)?, tx.inputs.len())))
-        .collect::<Result<_, Error>>()?;
-    let messages =
-        serialized_transactions_inputs
-            .iter()
-            .flat_map(|(tx, n_inputs)| {
-                std::iter::repeat_n(tx.as_slice(), *n_inputs)
-            });
-    let pairs = body.authorizations.iter().zip(messages).collect::<Vec<_>>();
-    assert_eq!(pairs.len(), body.authorizations.len());
-    const CHUNK_SIZE: usize = 1 << 14;
-    pairs.par_chunks(CHUNK_SIZE).try_for_each(|chunk| {
-        let (signatures, verifying_keys, messages): (
-            Vec<Signature>,
-            Vec<VerifyingKey>,
-            Vec<&[u8]>,
-        ) = chunk
-            .iter()
-            .map(|(auth, msg)| (auth.signature, auth.verifying_key, msg))
-            .collect();
-        ed25519_dalek::verify_batch(&messages, &signatures, &verifying_keys)
-    })?;
+        .iter()
+        .map(|tx| cached_serialize_transaction(tx)) 
+        .collect();
+    let serialized_transactions = serialized_transactions?;
+
+    let mut message_idx = 0;
+
+    for (tx_idx, tx) in body.transactions.iter().enumerate() {
+        let serialized_tx = &serialized_transactions[tx_idx];
+        for _ in 0..tx.inputs.len() {
+            let auth = &body.authorizations[message_idx];
+            all_signatures.push(auth.signature);
+            all_verifying_keys.push(auth.verifying_key);
+            all_messages.push(serialized_tx.as_slice());
+            message_idx += 1;
+        }
+    }
+
+    if all_signatures.len() < 1000 {
+        ed25519_dalek::verify_batch(&all_messages, &all_signatures, &all_verifying_keys)?;
+    } else {
+        let chunk_count = (all_signatures.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        
+        (0..chunk_count).into_par_iter().try_for_each(|i| {
+            let start = i * CHUNK_SIZE;
+            let end = std::cmp::min(start + CHUNK_SIZE, all_signatures.len());
+            
+            let sigs = &all_signatures[start..end];
+            let keys = &all_verifying_keys[start..end];
+            let msgs = &all_messages[start..end];
+            
+            ed25519_dalek::verify_batch(msgs, sigs, keys)
+        })?;
+    }
+
     Ok(())
 }
 
