@@ -653,14 +653,7 @@ impl Body {
             CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
         };
 
-        // Consider parallelizing this hash too for large coinbases
-        let coinbase_root = if coinbase.len() > 100 {
-            parallel_hash_large(&coinbase)
-        } else {
-            hashes::hash(&coinbase)
-        };
-
-        let root = hashes::hash(&(coinbase_root, txs_root)).into();
+        let root = hashes::hash(&(hashes::hash(&coinbase), txs_root)).into();
         Ok(root)
     }
 
@@ -846,21 +839,6 @@ fn compute_merkle_leaves_simple_parallel(
             })
         })
         .collect()
-}
-
-/// Parallel hash computation for large data
-fn parallel_hash_large<T: BorshSerialize>(data: &T) -> Hash {
-    let serialized = borsh::to_vec(data).expect("serialization failed");
-    
-    // Blake3 supports parallel hashing for large data
-    if serialized.len() > 1024 {
-        blake3::Hasher::new()
-            .update(&serialized)  // Parallel update if available
-            .finalize()
-            .into()
-    } else {
-        blake3::hash(&serialized).into()
-    }
 }
 
 pub trait Verify {
